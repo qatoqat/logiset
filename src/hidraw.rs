@@ -9,7 +9,6 @@ use std::thread;
 
 pub const LOGITECH: u16 = 0x046d;
 
-pub const BUS_USB: u16 = 0x03;
 pub const BUS_BLUETOOTH: u16 = 0x05;
 
 /// HID++ report IDs a node declares in its report descriptor.

@@ -17,16 +17,24 @@ const SUB_BOLT_PAIRING: u8 = 0x50;
 const SUB_BOLT_NAME: u8 = 0x60;
 
 const TIMEOUT: Duration = Duration::from_millis(1000);
+/// Long register reads can be slow on busy receivers (Solaar allows 1.8 s).
+const TIMEOUT_LONG: Duration = Duration::from_millis(1800);
 
 /// Read a register of the receiver (`index` = 0xFF) or of a HID++ 1.0 device.
 pub fn read_register(t: &Transport, index: u8, register: u8, long: bool, params: [u8; 3]) -> Result<Vec<u8>> {
     let sub_id = if long { GET_LONG } else { GET_SHORT };
     let packet = [REPORT_SHORT, index, sub_id, register, params[0], params[1], params[2]];
-    t.transact(&packet, TIMEOUT, |r| {
+    // Sub-registered reads echo their first parameter; without checking it a late reply to
+    // an earlier read of the same register would be taken for this one.
+    let echoed = register == RECEIVER_INFO;
+    t.transact(&packet, if long { TIMEOUT_LONG } else { TIMEOUT }, |r| {
         if r.len() < 7 || r[1] != index {
             return None;
         }
         if r[2] == sub_id && r[3] == register {
+            if echoed && r[4] != params[0] {
+                return None;
+            }
             return Some(Ok(r[4..].to_vec()));
         }
         if r[2] == 0x8F && r[3] == sub_id && r[4] == register {
@@ -54,26 +62,36 @@ pub fn max_devices(t: &Transport) -> u8 {
     }
 }
 
+/// Bolt receivers keep pairing data in their own sub-register range.
+pub fn is_bolt(product: u16) -> bool {
+    product == 0xC548
+}
+
 /// What the receiver remembers about pairing slot `slot` (1-based), or `None` when empty.
-pub fn pairing_info(t: &Transport, slot: u8) -> Option<Paired> {
-    if let Ok(r) = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_PAIRING + slot - 1, 0, 0]) {
-        if r.len() >= 8 {
-            let mut p = Paired { slot, wpid: u16::from_be_bytes([r[3], r[4]]), kind: Kind::from_hidpp10(r[7]), ..Default::default() };
-            if let Ok(e) = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_EXTENDED_PAIRING + slot - 1, 0, 0]) {
-                if e.len() >= 5 {
-                    p.serial = Some(u32::from_be_bytes([e[1], e[2], e[3], e[4]]));
-                }
-            }
-            if let Ok(n) = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_NAME + slot - 1, 0, 0]) {
-                if n.len() > 2 {
-                    let len = (n[1] as usize).min(n.len() - 2);
-                    p.name = Some(String::from_utf8_lossy(&n[2..2 + len]).into_owned()).filter(|s| !s.is_empty());
-                }
-            }
-            return Some(p);
-        }
+pub fn pairing_info(t: &Transport, slot: u8, bolt: bool) -> Option<Paired> {
+    if bolt {
+        return bolt_pairing_info(t, slot);
     }
-    // Bolt receivers keep pairing data in a different sub-register range.
+    let r = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_PAIRING + slot - 1, 0, 0]).ok()?;
+    if r.len() < 8 {
+        return None;
+    }
+    let mut p = Paired { slot, wpid: u16::from_be_bytes([r[3], r[4]]), kind: Kind::from_hidpp10(r[7]), ..Default::default() };
+    if let Ok(e) = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_EXTENDED_PAIRING + slot - 1, 0, 0])
+        && e.len() >= 5
+    {
+        p.serial = Some(u32::from_be_bytes([e[1], e[2], e[3], e[4]]));
+    }
+    if let Ok(n) = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_NAME + slot - 1, 0, 0])
+        && n.len() > 2
+    {
+        let len = (n[1] as usize).min(n.len() - 2);
+        p.name = Some(String::from_utf8_lossy(&n[2..2 + len]).into_owned()).filter(|s| !s.is_empty());
+    }
+    Some(p)
+}
+
+fn bolt_pairing_info(t: &Transport, slot: u8) -> Option<Paired> {
     let r = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_BOLT_PAIRING + slot, 0, 0]).ok()?;
     if r.len() < 8 {
         return None;
@@ -85,11 +103,11 @@ pub fn pairing_info(t: &Transport, slot: u8) -> Option<Paired> {
         serial: Some(u32::from_be_bytes([r[4], r[5], r[6], r[7]])),
         ..Default::default()
     };
-    if let Ok(n) = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_BOLT_NAME + slot, 0x01, 0]) {
-        if n.len() > 3 {
-            let len = (n[2] as usize).min(14).min(n.len() - 3);
-            p.name = Some(String::from_utf8_lossy(&n[3..3 + len]).into_owned()).filter(|s| !s.is_empty());
-        }
+    if let Ok(n) = read_register(t, DIRECT, RECEIVER_INFO, true, [SUB_BOLT_NAME + slot, 0x01, 0])
+        && n.len() > 3
+    {
+        let len = (n[2] as usize).min(14).min(n.len() - 3);
+        p.name = Some(String::from_utf8_lossy(&n[3..3 + len]).into_owned()).filter(|s| !s.is_empty());
     }
     Some(p)
 }

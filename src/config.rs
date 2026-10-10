@@ -15,11 +15,14 @@ pub struct Config {
     /// Re-apply saved settings whenever a device connects.
     pub auto_apply: bool,
     pub devices: BTreeMap<String, SavedDevice>,
+    /// Problem found while loading, for the UI to show.
+    #[serde(skip)]
+    pub warning: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { auto_apply: true, devices: BTreeMap::new() }
+        Config { auto_apply: true, devices: BTreeMap::new(), warning: None }
     }
 }
 
@@ -37,14 +40,47 @@ impl Config {
         util::config_dir().join("config.json")
     }
 
+    /// Load the config. Device records that do not parse are skipped; a file that is not
+    /// JSON at all is copied to `config.json.bad` so the next save does not lose it.
     pub fn load() -> Config {
-        match fs::read(Self::path()) {
-            Ok(data) => serde_json::from_slice(&data).unwrap_or_else(|e| {
-                eprintln!("logiset: ignoring unreadable {}: {e}", Self::path().display());
-                Config::default()
-            }),
-            Err(_) => Config::default(),
+        let path = Self::path();
+        let Ok(data) = fs::read(&path) else {
+            return Config::default();
+        };
+        match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(value) => Self::from_value(value),
+            Err(e) => {
+                let bad = path.with_extension("json.bad");
+                let warning = if fs::copy(&path, &bad).is_ok() {
+                    format!("{} was not valid JSON ({e}); it was copied to {} and saved settings start empty", path.display(), bad.display())
+                } else {
+                    format!("{} was not valid JSON ({e}); saved settings start empty", path.display())
+                };
+                Config { warning: Some(warning), ..Config::default() }
+            }
         }
+    }
+
+    fn from_value(value: serde_json::Value) -> Config {
+        let mut config = Config::default();
+        if let Some(auto) = value.get("auto_apply").and_then(|v| v.as_bool()) {
+            config.auto_apply = auto;
+        }
+        let mut skipped = Vec::new();
+        if let Some(devices) = value.get("devices").and_then(|v| v.as_object()) {
+            for (key, record) in devices {
+                match serde_json::from_value::<SavedDevice>(record.clone()) {
+                    Ok(dev) => {
+                        config.devices.insert(key.clone(), dev);
+                    }
+                    Err(_) => skipped.push(key.clone()),
+                }
+            }
+        }
+        if !skipped.is_empty() {
+            config.warning = Some(format!("ignored unreadable saved settings for: {}", skipped.join(", ")));
+        }
+        config
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -65,8 +101,17 @@ impl Config {
     }
 
     pub fn forget(&mut self, key: &str, slot: &str) {
+        self.forget_where(key, |s| s == slot);
+    }
+
+    /// Drop every saved setting of a device whose key starts with `prefix`.
+    pub fn forget_prefix(&mut self, key: &str, prefix: &str) {
+        self.forget_where(key, |s| s.starts_with(prefix));
+    }
+
+    fn forget_where(&mut self, key: &str, matches: impl Fn(&str) -> bool) {
         if let Some(dev) = self.devices.get_mut(key) {
-            dev.settings.remove(slot);
+            dev.settings.retain(|slot, _| !matches(slot));
             if dev.settings.is_empty() {
                 self.devices.remove(key);
             }
@@ -87,5 +132,37 @@ impl Config {
             .unwrap_or_default();
         out.sort_by_key(|(k, a)| (a.replay_rank(), k.clone()));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bad_device_record_is_skipped_not_fatal() {
+        let value = serde_json::json!({
+            "auto_apply": false,
+            "devices": {
+                "good": { "name": "G502", "settings": { "pointer.dpi.0": {"Pointer": {"SetDpi": {"sensor": 0, "dpi": 800}}} } },
+                "bad": { "name": null, "settings": 5 }
+            }
+        });
+        let config = Config::from_value(value);
+        assert!(!config.auto_apply);
+        assert_eq!(config.devices.len(), 1);
+        assert_eq!(config.actions("good").len(), 1);
+        assert!(config.warning.as_deref().unwrap().contains("bad"));
+    }
+
+    #[test]
+    fn forget_prefix_keeps_other_settings() {
+        let mut config = Config::default();
+        let dev = config.devices.entry("k".into()).or_default();
+        for slot in ["lighting.zone.0", "lighting.zone.1", "pointer.rate"] {
+            dev.settings.insert(slot.into(), serde_json::Value::Null);
+        }
+        config.forget_prefix("k", "lighting.zone.");
+        assert_eq!(config.devices["k"].settings.keys().collect::<Vec<_>>(), ["pointer.rate"]);
     }
 }

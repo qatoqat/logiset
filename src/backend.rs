@@ -34,7 +34,7 @@ pub enum Event {
     /// The full, ordered device list.
     Devices(Vec<DeviceState>),
     /// One device changed.
-    Device(DeviceState),
+    Device(Box<DeviceState>),
     Busy(String, bool),
     Status(String),
     Error(String),
@@ -49,14 +49,18 @@ pub enum Mode {
     Gui,
     /// Never write anything.
     ReadOnly,
-    /// Always re-apply saved settings on connect.
+    /// Always re-apply saved settings on connect (`logiset apply`).
     Apply,
+    /// Background service: re-apply on connect when the user enabled it (`logiset apply --watch`).
+    Watch,
 }
 
 struct Entry {
     state: DeviceState,
     dev: Option<Device>,
     transport: Arc<Transport>,
+    /// USB product ID of the node (the receiver's, for paired devices).
+    product: u16,
     /// Pairing serial (receiver slots) or unit ID (online devices); the same device
     /// on cable and receiver shares it.
     serial: Option<u32>,
@@ -113,14 +117,15 @@ fn run<T>(slot: &mut Slot<T>, f: impl FnOnce(&mut T) -> hidpp::Result<()>) -> Re
     }
 }
 
-fn blank(id: String, path: PathBuf, index: u8, receiver: Option<String>) -> DeviceState {
+fn blank(id: String, node: &NodeInfo, index: u8, receiver: Option<String>) -> DeviceState {
     DeviceState {
         id,
         config_key: String::new(),
         name: String::new(),
         kind: Kind::Other,
         online: false,
-        path,
+        path: node.devnode.clone(),
+        bus: node.bus,
         index,
         receiver,
         wpid: None,
@@ -171,13 +176,12 @@ impl Backend {
         self.entries.iter().filter(|e| self.visible(e)).map(|e| e.state.clone()).collect()
     }
 
-    pub fn problems(&self) -> &[String] {
-        &self.problems
-    }
-
     pub fn run(mut self, commands: Receiver<Command>) {
         (self.sink)(Event::AutoApply(self.config.auto_apply));
-        self.scan();
+        if let Some(w) = self.config.warning.take() {
+            (self.sink)(Event::Error(w));
+        }
+        self.scan(true);
         loop {
             match commands.recv_timeout(Duration::from_millis(500)) {
                 Ok(cmd) => self.handle(cmd),
@@ -199,9 +203,10 @@ impl Backend {
     fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::Rescan => {
+                // Re-reads everything but does not write saved settings back: nothing reconnected.
                 self.entries.clear();
                 self.transports.clear();
-                self.scan();
+                self.scan(false);
             }
             Command::Refresh(id) => {
                 if let Some(i) = self.find(&id) {
@@ -238,7 +243,7 @@ impl Backend {
                     self.save_config();
                     self.entries[i].state.saved = self.saved_list(&config_key);
                     let state = self.entries[i].state.clone();
-                    (self.sink)(Event::Device(state));
+                    (self.sink)(Event::Device(Box::new(state)));
                 }
             }
             Command::SetAutoApply(on) => {
@@ -283,11 +288,11 @@ impl Backend {
     /// After I/O on entry `i`: notice disconnects and publish the new state.
     fn after_io(&mut self, i: usize) {
         if !self.entries[i].transport.is_alive() {
-            self.scan();
+            self.scan(true);
             return;
         }
         let state = self.entries[i].state.clone();
-        (self.sink)(Event::Device(state));
+        (self.sink)(Event::Device(Box::new(state)));
     }
 
     fn apply(&mut self, i: usize, action: &Action) -> Result<(), String> {
@@ -317,6 +322,9 @@ impl Backend {
             Ok(()) => {
                 if remember && action.persist_key().is_some() {
                     let key = self.entries[i].state.config_key.clone();
+                    for prefix in action.supersedes() {
+                        self.config.forget_prefix(&key, prefix);
+                    }
                     self.config.remember(&key, &name, action);
                     self.save_config();
                     self.entries[i].state.saved = self.saved_list(&key);
@@ -337,22 +345,32 @@ impl Backend {
 
     fn should_auto_apply(&self) -> bool {
         match self.mode {
-            Mode::Gui => self.config.auto_apply,
+            Mode::Gui | Mode::Watch => self.config.auto_apply,
             Mode::ReadOnly => false,
             Mode::Apply => true,
         }
+    }
+
+    /// Pick up changes another logiset process (the window or the service) saved.
+    fn reload_config(&mut self) {
+        let mut config = Config::load();
+        if let Some(w) = config.warning.take() {
+            (self.sink)(Event::Error(w));
+        }
+        self.config = config;
     }
 
     /// Identify and probe a freshly reachable device.
     fn connect(&self, dev: Device, transport: Arc<Transport>, receiver: Option<String>, node: &NodeInfo, pairing: Option<&receiver::Paired>) -> Entry {
         let ident = info::identify(&dev);
         let id = format!("{}#{}", transport.path.display(), dev.index);
-        let mut state = blank(id, transport.path.clone(), dev.index, receiver);
+        let mut state = blank(id, node, dev.index, receiver);
         state.name = ident
             .name
             .clone()
             .or_else(|| pairing.and_then(|p| p.name.clone()))
-            .unwrap_or_else(|| node.name.trim_start_matches("Logitech ").to_owned());
+            .unwrap_or_else(|| node.name.clone());
+        state.name = state.name.trim_start_matches("Logitech ").to_owned();
         state.kind = match ident.kind {
             Kind::Other => match pairing {
                 Some(p) if p.kind != Kind::Other => p.kind,
@@ -373,20 +391,27 @@ impl Backend {
         state.config_key = ident.config_key(&format!("{:04x}-{}", node.product, state.name));
         probe_all(&dev, &mut state);
         let serial = ident.unit_id.or_else(|| pairing.and_then(|p| p.serial));
-        let mut entry = Entry { state, dev: Some(dev), transport, serial };
+        let mut entry = Entry { state, dev: Some(dev), transport, product: node.product, serial };
         entry.state.saved = self.saved_list(&entry.state.config_key);
         entry
     }
 
     /// Re-apply saved settings to a device that just connected.
     fn on_connected(&mut self, i: usize) {
+        if self.mode == Mode::ReadOnly {
+            return;
+        }
+        self.reload_config();
+        let key = self.entries[i].state.config_key.clone();
+        self.entries[i].state.saved = self.saved_list(&key);
         if self.should_auto_apply() && !self.entries[i].state.saved.is_empty() {
             self.replay(i);
         }
     }
 
     /// Find all devices. Already-probed online devices on unchanged nodes are kept as they are.
-    pub fn scan(&mut self) {
+    /// Newly found devices get their saved settings re-applied when `replay` is set.
+    pub fn scan(&mut self, replay: bool) {
         let nodes = hidraw::enumerate();
         self.nodes = nodes.iter().map(|n| n.devnode.clone()).collect();
         self.last_node_check = Instant::now();
@@ -440,9 +465,10 @@ impl Backend {
                     fresh.extend(previous);
                     continue;
                 }
+                let bolt = receiver::is_bolt(node.product);
                 match Device::open(transport.clone(), index) {
                     Ok(dev) => {
-                        let pairing = if index == DIRECT { None } else { receiver::pairing_info(&transport, index) };
+                        let pairing = if index == DIRECT { None } else { receiver::pairing_info(&transport, index, bolt) };
                         let entry = self.connect(dev, transport.clone(), receiver_label, node, pairing.as_ref());
                         connected.push(fresh.len());
                         fresh.push(entry);
@@ -452,13 +478,13 @@ impl Backend {
                     Err(_) => {
                         if let Some(prev) = previous {
                             fresh.push(prev);
-                        } else if let Some(p) = receiver::pairing_info(&transport, index) {
-                            let mut state = blank(id, node.devnode.clone(), index, receiver_label);
+                        } else if let Some(p) = receiver::pairing_info(&transport, index, bolt) {
+                            let mut state = blank(id, node, index, receiver_label);
                             state.name = p.name.clone().unwrap_or_else(|| format!("Paired device {index}"));
                             state.kind = p.kind;
                             state.wpid = Some(p.wpid);
                             state.unit_id = p.serial;
-                            fresh.push(Entry { state, dev: None, transport: transport.clone(), serial: p.serial });
+                            fresh.push(Entry { state, dev: None, transport: transport.clone(), product: node.product, serial: p.serial });
                         }
                     }
                 }
@@ -471,31 +497,33 @@ impl Backend {
             self.problems = problems.clone();
             (self.sink)(Event::Problems(problems));
         }
-        for i in connected {
-            self.on_connected(i);
+        if replay {
+            for i in connected {
+                self.on_connected(i);
+            }
         }
         self.emit_devices();
     }
 
     /// Bring receiver slot `i` online if the device answers.
     fn try_reconnect(&mut self, i: usize) -> bool {
-        let (transport, index, receiver_label, path) = {
+        let (transport, index, receiver_label, product) = {
             let e = &self.entries[i];
-            (e.transport.clone(), e.state.index, e.state.receiver.clone(), e.state.path.clone())
+            (e.transport.clone(), e.state.index, e.state.receiver.clone(), e.product)
         };
         let Ok(dev) = Device::open(transport.clone(), index) else {
             return false;
         };
         let node = NodeInfo {
-            devnode: path,
-            bus: hidraw::BUS_USB,
+            devnode: self.entries[i].state.path.clone(),
+            bus: self.entries[i].state.bus,
             vendor: hidraw::LOGITECH,
-            product: 0,
+            product,
             name: self.entries[i].state.name.clone(),
             reports: transport.reports,
             behind_receiver: false,
         };
-        let pairing = receiver::pairing_info(&transport, index);
+        let pairing = receiver::pairing_info(&transport, index, receiver::is_bolt(product));
         let entry = self.connect(dev, transport, receiver_label, &node, pairing.as_ref());
         self.entries[i] = entry;
         self.on_connected(i);
@@ -530,7 +558,7 @@ impl Backend {
                     changed = true;
                 }
                 None if online => {
-                    self.scan();
+                    self.scan(true);
                     return;
                 }
                 _ => {}
@@ -542,7 +570,7 @@ impl Backend {
             self.last_node_check = Instant::now();
             let now: Vec<PathBuf> = hidraw::enumerate().into_iter().map(|n| n.devnode).collect();
             if now != self.nodes || self.transports.values().any(|t| !t.is_alive()) {
-                self.scan();
+                self.scan(true);
                 return;
             }
         }
@@ -567,7 +595,7 @@ impl Backend {
                     if fresh != e.state.battery {
                         e.state.battery = fresh;
                         let state = e.state.clone();
-                        (self.sink)(Event::Device(state));
+                        (self.sink)(Event::Device(Box::new(state)));
                     }
                 }
             }

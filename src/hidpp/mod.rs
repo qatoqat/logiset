@@ -11,7 +11,7 @@ pub mod receiver;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -127,10 +127,6 @@ impl Transport {
         }))
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
@@ -233,13 +229,14 @@ impl Transport {
             &packet
         };
         let reply = self.transact(packet, TIMEOUT, |r| {
-            if r.len() < 7 || r[1] != index {
+            // Some Bluetooth devices answer requests sent to 0xFF with index 0x00.
+            if r.len() < 7 || (r[1] != index && !(index == DIRECT && r[1] == 0)) {
                 return None;
             }
             if r[2] == feature_index && r[3] == fs {
                 return Some(Ok(r[4..].to_vec()));
             }
-            if r[0] == REPORT_LONG && r[2] == 0xFF && r[3] == feature_index && r[4] == fs {
+            if r[2] == 0xFF && r[3] == feature_index && r[4] == fs {
                 return Some(Err(Error::Hidpp20(r[5])));
             }
             if r[0] == REPORT_SHORT && r[2] == 0x8F && r[3] == feature_index && r[4] == fs {
@@ -268,12 +265,6 @@ pub struct FeatureEntry {
     pub version: u8,
     /// bit 7 obsolete, bit 6 hidden (software), bit 5 internal (engineering)
     pub flags: u8,
-}
-
-impl FeatureEntry {
-    pub fn hidden(&self) -> bool {
-        self.flags & 0x60 != 0
-    }
 }
 
 /// A HID++ 2.0 device reachable at `index` on `transport`.
@@ -340,9 +331,6 @@ impl Device {
         self.transport.call(self.index, feature_index, function, params)
     }
 
-    pub fn via_receiver(&self) -> bool {
-        self.index != DIRECT
-    }
 }
 
 /// Human-readable names for the feature IDs we know about.

@@ -22,10 +22,11 @@ enum Tab {
 }
 
 impl Tab {
-    fn label(self) -> &'static str {
+    fn label(self, dev: &DeviceState) -> &'static str {
         match self {
             Tab::Overview => "Overview",
-            Tab::Pointer => "Pointer",
+            Tab::Pointer if dev.is_pointer() => "Pointer",
+            Tab::Pointer => "Report rate",
             Tab::Lighting => "Lighting",
             Tab::Profiles => "Onboard profiles",
             Tab::Keyboard => "Keyboard",
@@ -90,8 +91,8 @@ impl App {
                     self.drafts.retain(|id, _| self.devices.iter().any(|d| &d.id == id));
                 }
                 Event::Device(state) => match self.devices.iter_mut().find(|d| d.id == state.id) {
-                    Some(d) => *d = state,
-                    None => self.devices.push(state),
+                    Some(d) => *d = *state,
+                    None => self.devices.push(*state),
                 },
                 Event::Busy(id, true) => {
                     self.busy.insert(id);
@@ -238,7 +239,7 @@ impl App {
         }
         ui.horizontal(|ui| {
             for t in &tabs {
-                ui.selectable_value(&mut self.tab, *t, t.label());
+                ui.selectable_value(&mut self.tab, *t, t.label(&dev));
             }
         });
         ui.separator();

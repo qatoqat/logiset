@@ -43,7 +43,7 @@ const FN_GET_DPI: u8 = 11;
 const FN_SET_DPI: u8 = 12;
 
 /// Sector of the profile directory the user edits.
-const DIRECTORY: u16 = 0x0000;
+pub const DIRECTORY: u16 = 0x0000;
 /// First read-only (factory) sector; the factory directory lives here too.
 const ROM_BASE: u16 = 0x0100;
 /// DPI steps per profile.
@@ -509,11 +509,14 @@ pub fn probe(dev: &Device) -> Option<Result<State>> {
 /// Perform `action` on the device and verify it. Then update `state` to match the device.
 ///
 /// Sector writes first save the current contents to the backup directory, then read the
-/// sector back and fail when it does not match what was written.
+/// sector back and fail when it does not match what was written. When an action fails part
+/// way, `state` still records each step that succeeded, and a failed sector write re-reads
+/// that sector.
 pub fn apply(dev: &Device, state: &mut State, action: &Action) -> Result<()> {
     match action {
         Action::SetMode(mode) => {
             set_mode(dev, *mode)?;
+            state.mode = *mode;
             state.mode = read_mode(dev)?;
         }
         Action::SetActiveProfile(sector) => {
@@ -526,21 +529,28 @@ pub fn apply(dev: &Device, state: &mut State, action: &Action) -> Result<()> {
                 return Err(invalid("profile is disabled"));
             }
             set_mode(dev, Mode::Onboard)?;
+            state.mode = Mode::Onboard;
             dev.call(FEATURE, FN_SET_PROFILE, &sector.to_be_bytes())?;
+            state.current_profile = *sector;
             state.mode = read_mode(dev)?;
             state.current_profile = read_profile(dev)?;
         }
         Action::SetDpiIndex(index) => {
             let index = step(*index)?;
             dev.call(FEATURE, FN_SET_DPI, &[index])?;
+            state.dpi_index = Some(index);
             state.dpi_index = Some(read_dpi(dev)?);
         }
         Action::WriteProfile { sector, profile } => {
             let idx = user_entry(state, *sector)?;
             check_layout(profile, &state.description)?;
-            let (size, buttons, gbuttons) = layout(state);
-            let image = update_sector(dev, &state.device_tag, *sector, size, |_| profile.to_bytes())?;
-            state.profiles[idx].profile = Profile::parse(&image, buttons, gbuttons).map_err(|e| e.to_string());
+            let (size, _, _) = layout(state);
+            let written = update_sector(dev, &state.device_tag, *sector, size, |current| {
+                let stored = state.profiles[idx].profile.as_ref().ok().map(|p| p.raw.as_slice());
+                ensure_unchanged(idx, stored, &profile.raw, current)?;
+                profile.to_bytes()
+            });
+            settle_write(dev, state, idx, written)?;
         }
         Action::SetProfileEnabled { sector, enabled } => {
             if state.rom {
@@ -561,12 +571,12 @@ pub fn apply(dev: &Device, state: &mut State, action: &Action) -> Result<()> {
         }
         Action::RestoreSector { sector, bytes } => {
             let idx = user_entry(state, *sector)?;
-            let (size, buttons, gbuttons) = layout(state);
+            let (size, _, _) = layout(state);
             if bytes.len() != size || !checksum_ok(bytes) {
                 return Err(invalid("backup does not match this device's profile size or checksum"));
             }
-            let image = update_sector(dev, &state.device_tag, *sector, size, |_| Ok(bytes.clone()))?;
-            state.profiles[idx].profile = Profile::parse(&image, buttons, gbuttons).map_err(|e| e.to_string());
+            let written = update_sector(dev, &state.device_tag, *sector, size, |_| Ok(bytes.clone()));
+            settle_write(dev, state, idx, written)?;
         }
     }
     Ok(())
@@ -766,6 +776,46 @@ fn check_layout(profile: &Profile, d: &Description) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a write whose edit was not made on the copy stored in `state`, or when the mouse no
+/// longer holds that copy. Writing then would put back bytes the mouse has since changed.
+fn ensure_unchanged(index: usize, stored: Option<&[u8]>, based_on: &[u8], current: &[u8]) -> Result<()> {
+    if stored == Some(current) && stored == Some(based_on) {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "profile {} changed on the mouse since it was read; press Refresh and redo the edit",
+        index + 1
+    )))
+}
+
+/// Read and parse one profile sector. A failure is kept as text, as the directory listing does.
+fn read_entry(
+    dev: &Device,
+    sector: u16,
+    size: usize,
+    buttons: usize,
+    gbuttons: usize,
+) -> std::result::Result<Profile, String> {
+    read_sector(dev, sector, size).and_then(|raw| Profile::parse(&raw, buttons, gbuttons)).map_err(|e| e.to_string())
+}
+
+/// Store the outcome of a sector write for the profile at `idx`. After a failed write the sector
+/// is read back, so `state` shows what the mouse holds. The write's error is returned either way.
+fn settle_write(dev: &Device, state: &mut State, idx: usize, written: Result<Vec<u8>>) -> Result<()> {
+    let (size, buttons, gbuttons) = layout(state);
+    let sector = state.profiles[idx].sector;
+    match written {
+        Ok(image) => {
+            state.profiles[idx].profile = Profile::parse(&image, buttons, gbuttons).map_err(|e| e.to_string());
+            Ok(())
+        }
+        Err(e) => {
+            state.profiles[idx].profile = read_entry(dev, sector, size, buttons, gbuttons);
+            Err(e)
+        }
+    }
+}
+
 /// Read `sector`, let `change` build the image to store from it, and write only when that
 /// differs. Before writing, the current contents are saved to a backup file. After writing,
 /// the sector is read back and must match. Returns the image now stored.
@@ -862,11 +912,10 @@ fn read_state(dev: &Device) -> Result<State> {
     let (buttons, gbuttons) = (description.button_slots(), description.g_button_slots());
     let profiles = directory_entries(&dir)
         .into_iter()
-        .map(|(sector, enabled)| {
-            let profile = read_sector(dev, sector, size)
-                .and_then(|raw| Profile::parse(&raw, buttons, gbuttons))
-                .map_err(|e| e.to_string());
-            ProfileEntry { sector, enabled, profile }
+        .map(|(sector, enabled)| ProfileEntry {
+            sector,
+            enabled,
+            profile: read_entry(dev, sector, size, buttons, gbuttons),
         })
         .collect();
     Ok(State { description, mode, current_profile, dpi_index, rom, device_tag: device_tag(dev), profiles })
@@ -1112,6 +1161,21 @@ mod tests {
         bad[40] ^= 0x01;
         assert!(Profile::parse(&bad, 11, 11).is_err());
         assert!(Profile::parse(&raw, 17, 11).is_err());
+    }
+
+    #[test]
+    fn stale_edits_are_refused() {
+        let raw = fixture();
+        let stored = Some(raw.as_slice());
+        assert!(ensure_unchanged(0, stored, &raw, &raw).is_ok());
+
+        let mut changed = raw.clone();
+        changed[OFF_DPI] ^= 0x01;
+        let err = ensure_unchanged(1, stored, &raw, &changed).unwrap_err().to_string();
+        assert!(err.starts_with("profile 2 changed on the mouse"), "{err}");
+        assert!(err.contains("Refresh"), "{err}");
+        assert!(ensure_unchanged(0, None, &raw, &raw).is_err(), "no readable stored copy");
+        assert!(ensure_unchanged(0, stored, &changed, &raw).is_err(), "edit built on another copy");
     }
 
     #[test]

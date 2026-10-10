@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use eframe::egui::{self, RichText};
 
 use crate::features::onboard::{
-    Action, ButtonAction, DPI_STEPS, FUNCTIONS, MOUSE_BUTTONS, Mode, Profile, REPORT_RATES, State,
+    Action, ButtonAction, DIRECTORY, DPI_STEPS, FUNCTIONS, MOUSE_BUTTONS, Mode, Profile, REPORT_RATES, State,
 };
 use crate::hid_usage;
 use crate::model::DeviceState;
@@ -20,12 +20,15 @@ const COMMON_RATES: &[u8] = &[1, 2, 4, 8];
 const ROM_SECTOR: u16 = 0x0100;
 /// A profile name holds 24 UTF-16 units.
 const NAME_UNITS: usize = 24;
+/// Hover text for controls that stay disabled until the open profile is written or reverted.
+const UNSAVED_HINT: &str = "Write or revert your changes first";
 
 /// UI-only editing state for the panel.
 #[derive(Default)]
 pub struct Draft {
-    /// The state the drafts were built from. A different state rebuilds them.
-    synced: Option<State>,
+    /// The stored copy of the open profile that `edit` was built from. A different stored copy
+    /// rebuilds the editor. Other changes to the state leave the edits alone.
+    stored: Option<Profile>,
     /// Sector of the profile open in the editor.
     selected: Option<u16>,
     /// Editable copy of the open profile.
@@ -46,33 +49,43 @@ enum Confirm {
 }
 
 impl Draft {
-    /// Rebuild the drafts when `state` differs from the one they were built from.
+    /// Drop the editor when its profile is gone, and rebuild it when the stored copy of the open
+    /// profile changed.
     fn sync(&mut self, state: &State) {
-        if self.synced.as_ref() == Some(state) {
-            return;
-        }
-        self.synced = Some(state.clone());
-        self.confirm = None;
-        self.error = None;
         self.selected = self.selected.filter(|s| state.profiles.iter().any(|p| p.sector == *s));
-        self.edit = self.selected.and_then(|s| stored_profile(state, s)).cloned();
+        let stored = self.selected.and_then(|s| stored_profile(state, s));
+        if stored != self.stored.as_ref() {
+            self.load(stored.cloned());
+        }
     }
 
     /// Open the editor on the stored profile at `sector`.
     fn select(&mut self, state: &State, sector: u16) {
         self.selected = Some(sector);
-        self.edit = stored_profile(state, sector).cloned();
+        self.load(stored_profile(state, sector).cloned());
+    }
+
+    /// Start the editor from `stored`, which is also what the editor is compared against.
+    fn load(&mut self, stored: Option<Profile>) {
+        self.edit = stored.clone();
+        self.stored = stored;
         self.confirm = None;
         self.error = None;
+    }
+
+    /// True while the editor holds changes the mouse does not have yet.
+    fn unsaved(&self) -> bool {
+        self.edit != self.stored
     }
 }
 
 /// Draw the panel. Edits stay in `draft` until the user writes them to the mouse.
 pub fn show(ui: &mut egui::Ui, _dev: &DeviceState, state: &State, draft: &mut Draft, out: &mut Vec<Action>) {
     draft.sync(state);
-    mode_section(ui, state, out);
+    let unsaved = draft.unsaved();
+    mode_section(ui, state, unsaved, out);
     ui.add_space(12.0);
-    profile_list(ui, state, draft, out);
+    profile_list(ui, state, draft, unsaved, out);
     if let Some(sector) = draft.selected {
         ui.add_space(12.0);
         match draft.edit.as_mut() {
@@ -95,16 +108,24 @@ fn stored_profile(state: &State, sector: u16) -> Option<&Profile> {
     state.profiles.iter().find(|p| p.sector == sector)?.profile.as_ref().ok()
 }
 
-fn mode_section(ui: &mut egui::Ui, state: &State, out: &mut Vec<Action>) {
+fn mode_section(ui: &mut egui::Ui, state: &State, unsaved: bool, out: &mut Vec<Action>) {
     ui.heading("Mode");
-    if ui.radio(state.mode == Mode::Onboard, "Onboard profiles (stored in the mouse)").clicked()
-        && state.mode != Mode::Onboard
-    {
+    let onboard = ui
+        .add_enabled(
+            !unsaved,
+            egui::RadioButton::new(state.mode == Mode::Onboard, "Onboard profiles (stored in the mouse)"),
+        )
+        .on_disabled_hover_text(UNSAVED_HINT);
+    if onboard.clicked() && state.mode != Mode::Onboard {
         out.push(Action::SetMode(Mode::Onboard));
     }
-    if ui.radio(state.mode == Mode::Host, "Host mode (settings from this computer)").clicked()
-        && state.mode != Mode::Host
-    {
+    let host = ui
+        .add_enabled(
+            !unsaved,
+            egui::RadioButton::new(state.mode == Mode::Host, "Host mode (settings from this computer)"),
+        )
+        .on_disabled_hover_text(UNSAVED_HINT);
+    if host.clicked() && state.mode != Mode::Host {
         out.push(Action::SetMode(Mode::Host));
     }
     ui.label(
@@ -116,7 +137,7 @@ fn mode_section(ui: &mut egui::Ui, state: &State, out: &mut Vec<Action>) {
     );
 }
 
-fn profile_list(ui: &mut egui::Ui, state: &State, draft: &mut Draft, out: &mut Vec<Action>) {
+fn profile_list(ui: &mut egui::Ui, state: &State, draft: &mut Draft, unsaved: bool, out: &mut Vec<Action>) {
     ui.heading("Profiles");
     ui.label(
         RichText::new(
@@ -142,13 +163,17 @@ fn profile_list(ui: &mut egui::Ui, state: &State, draft: &mut Draft, out: &mut V
         for entry in &state.profiles {
             let sector = entry.sector;
             let active = sector == state.current_profile;
+            let open = draft.selected == Some(sector);
+            // The open profile stays switchable: switching leaves the unsaved edits alone.
+            let locked = unsaved && !open;
             ui.vertical(|ui| {
                 match &entry.profile {
                     Ok(p) if p.name.is_empty() => {
                         ui.label("(no name)");
                     }
                     Ok(p) => {
-                        ui.label(p.name.as_str());
+                        // Never wrap: a wrapped name reads as one letter per line.
+                        ui.add(egui::Label::new(p.name.as_str()).wrap_mode(egui::TextWrapMode::Extend));
                     }
                     Err(e) => {
                         ui.label(RichText::new(format!("Cannot read: {e}")).color(ui.visuals().error_fg_color));
@@ -172,11 +197,11 @@ fn profile_list(ui: &mut egui::Ui, state: &State, draft: &mut Draft, out: &mut V
             if active {
                 ui.strong("Active");
             } else if entry.enabled {
-                if ui
-                    .button("Activate")
+                let activate = ui
+                    .add_enabled(!locked, egui::Button::new("Activate"))
                     .on_hover_text("Use this profile on the mouse. Also switches the mouse to onboard profiles.")
-                    .clicked()
-                {
+                    .on_disabled_hover_text(UNSAVED_HINT);
+                if activate.clicked() {
                     out.push(Action::SetActiveProfile(sector));
                 }
             } else {
@@ -184,9 +209,10 @@ fn profile_list(ui: &mut egui::Ui, state: &State, draft: &mut Draft, out: &mut V
             }
 
             let can_edit = !state.rom && sector < ROM_SECTOR && entry.profile.is_ok();
-            let open = draft.selected == Some(sector);
             let label = if open { "Editing" } else { "Edit" };
-            if ui.add_enabled(can_edit && !open, egui::Button::new(label)).clicked() {
+            let edit = ui.add_enabled(can_edit && !open && !unsaved, egui::Button::new(label));
+            let edit = if locked { edit.on_disabled_hover_text(UNSAVED_HINT) } else { edit };
+            if edit.clicked() {
                 draft.select(state, sector);
             }
             ui.end_row();
@@ -495,12 +521,19 @@ fn backups(ui: &mut egui::Ui, state: &State, draft: &mut Draft, out: &mut Vec<Ac
                 ui.label(format!("Sector 0x{:04X}", b.sector));
                 ui.label(format!("{} bytes", b.size));
                 ui.label(RichText::new(b.name.as_str()).small().weak());
-                if ui
-                    .add_enabled(!state.rom, egui::Button::new("Restore"))
-                    .on_disabled_hover_text("Factory profiles cannot be changed.")
-                    .clicked()
-                {
-                    draft.confirm = Some(Confirm::Restore { sector: b.sector, path: b.path.clone() });
+                match not_restorable(b.sector) {
+                    Some(note) => {
+                        ui.label(RichText::new(note).weak());
+                    }
+                    None => {
+                        if ui
+                            .add_enabled(!state.rom, egui::Button::new("Restore"))
+                            .on_disabled_hover_text("Factory profiles cannot be changed.")
+                            .clicked()
+                        {
+                            draft.confirm = Some(Confirm::Restore { sector: b.sector, path: b.path.clone() });
+                        }
+                    }
                 }
                 ui.end_row();
             }
@@ -522,6 +555,18 @@ fn backups(ui: &mut egui::Ui, state: &State, draft: &mut Draft, out: &mut Vec<Ac
             ui.label(RichText::new(error.as_str()).color(ui.visuals().error_fg_color));
         }
     });
+}
+
+/// Why a backup of `sector` cannot be restored, or `None` when it can. The directory is undone by
+/// toggling a profile's Enabled box, and factory sectors are read-only.
+fn not_restorable(sector: u16) -> Option<&'static str> {
+    if sector == DIRECTORY {
+        Some("Directory backup: undo by toggling Enabled")
+    } else if sector >= ROM_SECTOR {
+        Some("Factory ROM: cannot be restored")
+    } else {
+        None
+    }
 }
 
 /// Read the backup at `path` and queue its restore. A file of the wrong size is refused here.
@@ -603,19 +648,28 @@ mod tests {
     }
 
     #[test]
-    fn draft_keeps_edits_until_the_state_changes() {
+    fn draft_keeps_edits_until_the_stored_profile_changes() {
         let state = state_with(sample_profile());
         let mut draft = Draft::default();
         draft.sync(&state);
         draft.select(&state, 1);
         assert_eq!(draft.edit.as_ref(), stored_profile(&state, 1));
+        assert!(!draft.unsaved());
         draft.edit.as_mut().unwrap().report_rate = 2;
+        assert!(draft.unsaved());
         draft.sync(&state);
         assert_eq!(draft.edit.as_ref().unwrap().report_rate, 2, "the same state keeps the edit");
         let mut next = state.clone();
         next.mode = Mode::Host;
         draft.sync(&next);
-        assert_eq!(draft.edit.as_ref().unwrap().report_rate, 1, "a new state rebuilds the editor");
+        assert_eq!(draft.edit.as_ref().unwrap().report_rate, 2, "other changes keep the edit");
+        assert!(draft.unsaved());
+
+        let mut stored = sample_profile();
+        stored.report_rate = 4;
+        draft.sync(&state_with(stored));
+        assert_eq!(draft.edit.as_ref().unwrap().report_rate, 4, "a changed stored profile rebuilds the editor");
+        assert!(!draft.unsaved());
     }
 
     #[test]
@@ -642,6 +696,15 @@ mod tests {
         let mut nul = String::from("a\0b");
         fit_name(&mut nul);
         assert_eq!(nul, "ab");
+    }
+
+    #[test]
+    fn directory_and_factory_backups_are_not_restorable() {
+        assert!(not_restorable(0x0000).is_some());
+        assert!(not_restorable(0x0100).is_some());
+        assert!(not_restorable(0x0104).is_some());
+        assert!(not_restorable(0x0001).is_none());
+        assert!(not_restorable(0x00FF).is_none());
     }
 
     #[test]

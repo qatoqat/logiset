@@ -21,6 +21,8 @@ pub struct DeviceState {
     pub kind: Kind,
     pub online: bool,
     pub path: PathBuf,
+    /// HID bus of the node: 0x03 USB, 0x05 Bluetooth.
+    pub bus: u16,
     /// 0xFF when attached directly, otherwise the receiver pairing slot.
     pub index: u8,
     /// Name of the receiver this device is paired to, when reached through one.
@@ -57,9 +59,13 @@ impl DeviceState {
     pub fn connection_label(&self) -> String {
         match &self.receiver {
             Some(r) => format!("{r}, slot {}", self.index),
-            None if self.path.as_os_str().is_empty() => "unknown".into(),
-            None => "USB / Bluetooth".into(),
+            None if self.bus == crate::hidraw::BUS_BLUETOOTH => "Bluetooth".into(),
+            None => "USB cable".into(),
         }
+    }
+
+    pub fn is_pointer(&self) -> bool {
+        matches!(self.kind, Kind::Mouse | Kind::Trackball | Kind::Trackpad)
     }
 }
 
@@ -95,11 +101,24 @@ impl Action {
         }
     }
 
-    /// Replay order: the onboard/host mode switch must land before the settings it gates.
+    /// Replay order: the onboard/host mode switch must land before the settings it gates,
+    /// and the LED-control choice after the zone effects (which take control).
     pub fn replay_rank(&self) -> u8 {
         match self {
             Action::Onboard(_) => 0,
+            Action::Lighting(lighting::Action::SetControl(_)) => 2,
             _ => 1,
+        }
+    }
+
+    /// Saved-setting key prefixes this action makes obsolete once applied.
+    pub fn supersedes(&self) -> &'static [&'static str] {
+        match self {
+            // Handing the LEDs back to the device makes saved zone effects moot …
+            Action::Lighting(lighting::Action::SetControl(false)) => &["lighting.zone."],
+            // … and applying an effect takes control again.
+            Action::Lighting(lighting::Action::SetEffect { .. }) => &["lighting.control"],
+            _ => &[],
         }
     }
 }

@@ -116,24 +116,25 @@ pub fn identify(dev: &Device) -> Identity {
             id.kind = Kind::from_hidpp20(r[0]);
         }
     }
-    if dev.has(DEVICE_INFO) {
-        if let Ok(r) = dev.call(DEVICE_INFO, 0, &[]) {
-            let entities = r[0];
-            id.unit_id = Some(u32::from_be_bytes([r[1], r[2], r[3], r[4]]));
-            id.model_ids = (0..3).map(|i| u16::from_be_bytes([r[7 + i * 2], r[8 + i * 2]])).collect();
-            let capabilities = r[14];
-            for e in 0..entities {
-                if let Ok(fw) = dev.call(DEVICE_INFO, 1, &[e]) {
-                    id.firmware.push(parse_firmware(&fw));
-                }
+    if dev.has(DEVICE_INFO)
+        && let Ok(r) = dev.call(DEVICE_INFO, 0, &[])
+    {
+        let entities = r[0];
+        id.unit_id = Some(u32::from_be_bytes([r[1], r[2], r[3], r[4]]));
+        id.model_ids = (0..3).map(|i| u16::from_be_bytes([r[7 + i * 2], r[8 + i * 2]])).collect();
+        let capabilities = r[14];
+        for e in 0..entities {
+            if let Ok(fw) = dev.call(DEVICE_INFO, 1, &[e]) {
+                id.firmware.push(parse_firmware(&fw));
             }
-            if capabilities & 0x01 != 0 && dev.version(DEVICE_INFO).unwrap_or(0) >= 4 {
-                if let Ok(s) = dev.call(DEVICE_INFO, 2, &[]) {
-                    let serial: String = s[..12].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
-                    if !serial.is_empty() {
-                        id.serial = Some(serial);
-                    }
-                }
+        }
+        if capabilities & 0x01 != 0
+            && dev.version(DEVICE_INFO).unwrap_or(0) >= 4
+            && let Ok(s) = dev.call(DEVICE_INFO, 2, &[])
+        {
+            let serial: String = s[..12].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            if !serial.is_empty() {
+                id.serial = Some(serial);
             }
         }
     }

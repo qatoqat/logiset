@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -26,14 +26,18 @@ pub fn backup_dir() -> PathBuf {
     data_dir().join("backups")
 }
 
-/// Write via a temporary file and rename, so a crash never leaves a half-written file.
+/// Write via a synced temporary file and rename, then sync the directory, so the file is
+/// complete and on disk when this returns (backups are taken before writing device memory).
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, data)?;
-    fs::rename(&tmp, path)
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path)?;
+    fs::File::open(dir)?.sync_all()
 }
 
 /// Seconds since the Unix epoch, for file names.

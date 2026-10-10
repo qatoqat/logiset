@@ -63,11 +63,11 @@ impl ChargeState {
 pub struct State {
     /// Feature the reading came from (0x1004, 0x1000 or 0x1001).
     pub feature: u16,
-    /// Charge in percent. Estimated from the voltage when `estimated` is set.
+    /// Charge in percent. Estimated from the voltage when `estimated` is set; `None` without a reading.
     pub percent: Option<u8>,
     pub estimated: bool,
     pub voltage_mv: Option<u16>,
-    /// Level named by the device; only 0x1004 reports one.
+    /// Level named by the device: 0x1004 reports one, 0x1001 flags name Full and Critical.
     pub level: Option<Level>,
     pub charging: ChargeState,
     /// Derived from the charging state: `Some(true)` while charging, `Some(false)` while discharging.
@@ -134,34 +134,33 @@ pub fn parse_status(r: &[u8; 16]) -> State {
 
 /// 0x1001 getBatteryInfo: voltage in mV (big-endian), then flags.
 /// Flags: bit 7 charging, bits 0-1 charge status (bit 0 full), bit 3 fast, bit 4 slow, bit 5 critical.
+/// A 0 mV reading has no estimate, so it gives no percentage; the flags name the level instead.
 pub fn parse_voltage(r: &[u8; 16]) -> State {
     let voltage = u16::from_be_bytes([r[0], r[1]]);
     let flags = r[2];
     let mut charging = ChargeState::Discharging;
-    // Level used when the voltage gives no estimate: Solaar's AVERAGE, FULL and CRITICAL.
-    let mut fallback = 50u8;
     if flags & 0x80 != 0 {
         charging = ChargeState::Charging;
         if flags & 0x01 != 0 {
             charging = ChargeState::Full;
-            fallback = 90;
         }
     }
+    let mut level = (charging == ChargeState::Full).then_some(Level::Full);
     if flags & 0x08 != 0 {
         // Fast charge: nothing more to read from the flags.
     } else if flags & 0x10 != 0 {
         charging = ChargeState::SlowCharging;
     } else if flags & 0x20 != 0 {
-        fallback = 5;
+        level = Some(Level::Critical);
     }
-    let estimate = voltage_percent(voltage);
-    let percent = if estimate != 0 { estimate } else { fallback };
+    // Any voltage gets a curve estimate, and 0% from the curve is a real value.
+    let (percent, estimated) = if voltage == 0 { (None, false) } else { (Some(voltage_percent(voltage)), true) };
     State {
         feature: BATTERY_VOLTAGE,
-        percent: Some(percent),
-        estimated: true,
+        percent,
+        estimated,
         voltage_mv: Some(voltage),
-        level: None,
+        level,
         external_power: external_power(&charging),
         charging,
     }
@@ -298,15 +297,42 @@ mod tests {
     }
 
     #[test]
-    fn voltage_percent_and_fallbacks() {
+    fn voltage_percent_from_curve() {
         // 3900 mV falls between 3922 (70%) and 3859 (60%): 60 + 10 * 41 / 63 = 66.5 -> 67.
         let s = parse_voltage(&reply(&[0x0F, 0x3C, 0x00]));
         assert_eq!((s.percent, s.estimated, s.charging.clone()), (Some(67), true, ChargeState::Discharging));
         assert_eq!(s.external_power, Some(false));
-        // Below 3500 mV there is no estimate, so the flags choose the level (50, 90 or 5).
-        assert_eq!(parse_voltage(&reply(&[0x0D, 0x48, 0x00])).percent, Some(50));
-        assert_eq!(parse_voltage(&reply(&[0x0D, 0x48, 0x81])).percent, Some(90));
-        assert_eq!(parse_voltage(&reply(&[0x0D, 0x48, 0x20])).percent, Some(5));
+        assert_eq!(s.level, None);
+    }
+
+    #[test]
+    fn voltage_below_curve_is_zero_percent() {
+        // 3400 mV is a real reading below the curve: 0% is the estimate, not a flag fallback.
+        let s = parse_voltage(&reply(&[0x0D, 0x48, 0x00]));
+        assert_eq!((s.percent, s.estimated, s.level), (Some(0), true, None));
+        assert_eq!(summary(&s), "≈0%");
+        // The critical flag names the level next to the real percentage.
+        let s = parse_voltage(&reply(&[0x0D, 0x48, 0x20]));
+        assert_eq!((s.percent, s.estimated, s.level), (Some(0), true, Some(Level::Critical)));
+    }
+
+    #[test]
+    fn zero_voltage_names_level() {
+        // 0 mV is no reading: no percentage, and the flags name the level.
+        let s = parse_voltage(&reply(&[0x00, 0x00, 0x00]));
+        assert_eq!((s.percent, s.estimated, s.level), (None, false, None));
+        assert_eq!(summary(&s), "");
+
+        let s = parse_voltage(&reply(&[0x00, 0x00, 0x20]));
+        assert_eq!((s.percent, s.estimated, s.level), (None, false, Some(Level::Critical)));
+        assert_eq!(summary(&s), "critical");
+
+        let s = parse_voltage(&reply(&[0x00, 0x00, 0x81]));
+        assert_eq!((s.percent, s.estimated, s.level, s.charging.clone()), (None, false, Some(Level::Full), ChargeState::Full));
+        assert_eq!(summary(&s), "full");
+
+        // Fast charge hides the critical bit, as above.
+        assert_eq!(parse_voltage(&reply(&[0x00, 0x00, 0x28])).level, None);
     }
 
     #[test]

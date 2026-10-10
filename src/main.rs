@@ -5,6 +5,8 @@ mod features;
 mod hid_usage;
 mod hidpp;
 mod hidraw;
+#[cfg(test)]
+mod hwtest;
 mod model;
 mod ui;
 mod util;
@@ -22,6 +24,7 @@ Usage:
   logiset apply        re-apply saved settings to connected devices
   logiset apply --watch
                        keep running and re-apply whenever a device connects
+                       (honours \"Re-apply saved settings on connect\")
   logiset --version
 ";
 
@@ -75,31 +78,35 @@ fn print_event(e: Event) {
 }
 
 fn list() -> ExitCode {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
     let mut backend = Backend::new(Mode::ReadOnly, Box::new(print_event));
-    backend.scan();
+    backend.scan(false);
     let devices = backend.devices();
+    let mut out = String::new();
     if devices.is_empty() {
-        println!("No Logitech HID++ devices found.");
+        out.push_str("No Logitech HID++ devices found.\n");
     }
     for d in devices {
-        println!("{} {} [{}]", d.kind.icon(), d.name, if d.online { "online" } else { "offline" });
-        println!("  node        {} index 0x{:02X} ({})", d.path.display(), d.index, d.connection_label());
+        let _ = writeln!(out, "{} {} [{}]", d.kind.icon(), d.name, if d.online { "online" } else { "offline" });
+        let _ = writeln!(out, "  node        {} index 0x{:02X} ({})", d.path.display(), d.index, d.connection_label());
         if d.online {
-            println!("  protocol    HID++ {}.{}", d.protocol.0, d.protocol.1);
+            let _ = writeln!(out, "  protocol    HID++ {}.{}", d.protocol.0, d.protocol.1);
         }
         if let Some(unit) = d.unit_id {
-            println!("  unit id     {unit:08X}");
+            let _ = writeln!(out, "  unit id     {unit:08X}");
         }
         if !d.model_ids.is_empty() {
             let ids: Vec<String> = d.model_ids.iter().map(|m| format!("{m:04X}")).collect();
-            println!("  model ids   {}", ids.join(" "));
+            let _ = writeln!(out, "  model ids   {}", ids.join(" "));
         }
         for fw in &d.firmware {
-            println!("  firmware    {} {} {}", fw.kind, fw.name, fw.version);
+            let _ = writeln!(out, "  firmware    {} {} {}", fw.kind, fw.name, fw.version);
         }
         if !d.features.is_empty() {
             let f: Vec<String> = d.features.iter().map(|f| format!("{:04X}", f.id)).collect();
-            println!("  features    {}", f.join(" "));
+            let _ = writeln!(out, "  features    {}", f.join(" "));
         }
         let slices: [(&str, String); 6] = [
             ("battery", format!("{:?}", d.battery)),
@@ -111,20 +118,23 @@ fn list() -> ExitCode {
         ];
         for (name, value) in slices {
             if value != "None" {
-                println!("  {name:<11} {value}");
+                let _ = writeln!(out, "  {name:<11} {value}");
             }
         }
         for (_, text) in &d.saved {
-            println!("  saved       {text}");
+            let _ = writeln!(out, "  saved       {text}");
         }
-        println!();
+        out.push('\n');
     }
+    // A closed pipe (`logiset list | head`) is not an error worth a panic.
+    let _ = std::io::stdout().lock().write_all(out.as_bytes());
     ExitCode::SUCCESS
 }
 
 fn apply(watch: bool) -> ExitCode {
-    let mut backend = Backend::new(Mode::Apply, Box::new(print_event));
-    backend.scan();
+    let mode = if watch { Mode::Watch } else { Mode::Apply };
+    let mut backend = Backend::new(mode, Box::new(print_event));
+    backend.scan(true);
     if watch {
         backend.watch();
     }

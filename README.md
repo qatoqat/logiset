@@ -39,17 +39,17 @@ sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
 ```text
 logiset                 open the settings window
 logiset list            print detected devices and their current settings (read-only)
-logiset apply           re-apply saved settings to connected devices
+logiset apply           re-apply saved settings to connected devices now
 logiset apply --watch   keep running and re-apply whenever a device connects
 ```
 
-To keep settings applied after reconnects without the window open:
+To keep settings applied after reconnects without the window open, enable the user service. It runs `logiset apply --watch` and follows the window's *Re-apply saved settings on connect* checkbox:
 
 ```sh
 systemctl --user enable --now logiset.service
 ```
 
-Saved settings live in `~/.config/logiset/config.json`. Backups of onboard-profile memory, taken before every write, are stored in `~/.local/share/logiset/backups/`. You can restore them from the *Onboard profiles* tab.
+Saved settings live in `~/.config/logiset/config.json`. Backups of onboard-profile memory, taken before every write, are stored in `~/.local/share/logiset/backups/`. You can restore them from the *Onboard profiles* tab. Each write is read back and compared before logiset reports success, and a profile that changed on the mouse since logiset read it is never overwritten.
 
 ### Onboard vs host mode
 

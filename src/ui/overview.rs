@@ -4,11 +4,12 @@ use eframe::egui::{self, RichText};
 
 use crate::features::battery::{self, ChargeState};
 use crate::hidpp::feature_name;
+use crate::hidpp::info::Kind;
 use crate::model::DeviceState;
 
 pub fn show(ui: &mut egui::Ui, dev: &DeviceState) {
     if dev.onboard_mode() == Some(true) {
-        ui.label("This mouse runs from its onboard profile. DPI, report rate and lighting changes made here are temporary.");
+        ui.label(onboard_note(dev.kind));
         ui.add_space(8.0);
     }
 
@@ -70,6 +71,16 @@ pub fn show(ui: &mut egui::Ui, dev: &DeviceState) {
         });
 }
 
+/// Banner for a device in onboard mode. Only pointers have DPI and report rate settings.
+fn onboard_note(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Mouse | Kind::Trackball | Kind::Trackpad => {
+            "This device runs from its onboard profile. DPI, report rate and lighting changes made here are temporary."
+        }
+        _ => "This device runs from its onboard profile. Changes made here are temporary.",
+    }
+}
+
 fn row(ui: &mut egui::Ui, label: &str, value: impl Into<egui::WidgetText>) {
     ui.label(RichText::new(label).weak());
     ui.label(value);
@@ -129,4 +140,20 @@ fn flags_text(flags: u8) -> String {
         names.push("internal");
     }
     names.join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onboard_note_mentions_pointer_settings_only_for_pointers() {
+        for kind in [Kind::Mouse, Kind::Trackball, Kind::Trackpad] {
+            assert!(onboard_note(kind).contains("DPI"), "{kind:?}");
+        }
+        for kind in [Kind::Keyboard, Kind::Numpad, Kind::Headset, Kind::Other] {
+            let note = onboard_note(kind);
+            assert!(!note.contains("DPI") && !note.contains("report rate") && !note.contains("mouse"), "{kind:?}");
+        }
+    }
 }

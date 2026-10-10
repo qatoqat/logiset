@@ -111,6 +111,18 @@ impl Effect {
         self.id == other.id && self.encode() == other.encode()
     }
 
+    /// The effect with its intensity and period brought into their allowed ranges. Speed and saturation are one byte, so they always fit.
+    pub fn clamped(mut self) -> Effect {
+        if has_field(self.id, Field::Intensity) {
+            self.intensity = self.intensity.min(100);
+        }
+        if has_field(self.id, Field::Period) {
+            let (lo, hi) = period_range(self.id);
+            self.period = self.period.clamp(lo, hi);
+        }
+        self
+    }
+
     /// Short text such as "Breathe #ff0000 4.0 s".
     pub fn label(&self) -> String {
         let mut parts = vec![effect_name(self.id)];
@@ -213,6 +225,11 @@ pub fn effect_name(id: u16) -> String {
 /// Whether effect `id` takes parameter `field`.
 pub fn has_field(id: u16, field: Field) -> bool {
     fields_of(id).iter().any(|(f, _)| *f == field)
+}
+
+/// Whether the parameter layout of effect `id` is known. Solaar only offers and writes effects it knows.
+pub fn is_known(id: u16) -> bool {
+    spec(id).is_some()
 }
 
 /// Allowed range of the period of effect `id`, in milliseconds.
@@ -350,6 +367,9 @@ fn apply_with(call: impl Fn(u8, &[u8]) -> Result<[u8; 16]>, state: &mut State, a
             state.sw_control = Some(*on);
         }
         Action::SetEffect { zone, effect, .. } => {
+            if !is_known(effect.id) {
+                return Err(Error::Invalid(format!("{} has no known parameter layout", effect_name(effect.id))));
+            }
             let z = state.zones.iter_mut().find(|z| z.index == *zone).ok_or_else(|| Error::Invalid(format!("the device has no LED zone {zone}")))?;
             let index = z
                 .effects
@@ -357,12 +377,13 @@ fn apply_with(call: impl Fn(u8, &[u8]) -> Result<[u8; 16]>, state: &mut State, a
                 .find(|e| e.id == effect.id)
                 .map(|e| e.index)
                 .ok_or_else(|| Error::Invalid(format!("{} is not available on {}", effect_name(effect.id), z.title())))?;
+            let effect = effect.clone().clamped();
             if state.sw_control != Some(true) {
                 call(8, &[1])?;
                 state.sw_control = Some(true);
             }
-            call(3, &set_params(*zone, index, effect))?;
-            z.current = Some(effect.clone());
+            call(3, &set_params(*zone, index, &effect))?;
+            z.current = Some(effect);
         }
     }
     Ok(())
@@ -484,7 +505,7 @@ mod tests {
                 _ => g610(f, p),
             }
         };
-        let state = read_state(&call).unwrap();
+        let state = read_state(call).unwrap();
         assert!(state.readable);
         assert!(state.zones.iter().all(|z| z.current.is_none()));
     }
@@ -607,7 +628,7 @@ mod tests {
         let mut state = read_state(g610).unwrap();
         let breathe = Effect { color: [255, 0, 0], period: 4000, ..Effect::new(0x0a) };
         let action = Action::SetEffect { zone: 0, location: 1, effect: breathe.clone() };
-        apply_with(&call, &mut state, &action).unwrap();
+        apply_with(call, &mut state, &action).unwrap();
         assert_eq!(*log.borrow(), vec![(8, vec![1]), (3, vec![0, 2, 0xff, 0, 0, 0x0f, 0xa0, 0, 0x64, 0, 0, 0])]);
         assert_eq!(state.sw_control, Some(true));
         assert_eq!(state.zones[0].current, Some(breathe));
@@ -623,7 +644,7 @@ mod tests {
         let mut state = read_state(g610).unwrap();
         state.sw_control = Some(true);
         let action = Action::SetEffect { zone: 1, location: 2, effect: Effect::new(STATIC) };
-        apply_with(&call, &mut state, &action).unwrap();
+        apply_with(call, &mut state, &action).unwrap();
         assert_eq!(*log.borrow(), vec![(3, vec![1, 1, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0])]);
     }
 
@@ -636,11 +657,59 @@ mod tests {
         };
         let mut state = read_state(g610).unwrap();
         let missing_effect = Action::SetEffect { zone: 1, location: 2, effect: Effect::new(0x03) };
-        assert!(matches!(apply_with(&call, &mut state, &missing_effect), Err(Error::Invalid(_))));
+        assert!(matches!(apply_with(call, &mut state, &missing_effect), Err(Error::Invalid(_))));
         let missing_zone = Action::SetEffect { zone: 7, location: 0, effect: Effect::new(STATIC) };
-        assert!(matches!(apply_with(&call, &mut state, &missing_zone), Err(Error::Invalid(_))));
+        assert!(matches!(apply_with(call, &mut state, &missing_zone), Err(Error::Invalid(_))));
         assert!(log.borrow().is_empty());
         assert!(state.zones.iter().all(|z| z.current.is_none()));
+    }
+
+    #[test]
+    fn clamps_intensity_and_period_to_their_ranges() {
+        let high = Effect { intensity: 200, period: 50000, ..Effect::new(0x0a) };
+        assert_eq!(high.clamped(), Effect { intensity: 100, period: 20000, ..Effect::new(0x0a) });
+        assert_eq!(Effect { period: 3, ..Effect::new(0x17) }.clamped().period, 3);
+        assert_eq!(Effect { period: 1, ..Effect::new(0x17) }.clamped().period, 2);
+        assert_eq!(Effect { period: 500, ..Effect::new(0x0b) }.clamped().period, 200);
+        // Static has neither field, so its unused bytes are left alone.
+        assert_eq!(Effect { intensity: 200, ..Effect::new(STATIC) }.clamped().intensity, 200);
+    }
+
+    #[test]
+    fn known_effects_have_layouts() {
+        assert!(is_known(STATIC));
+        assert!(is_known(0x0a));
+        assert!(!is_known(0x05));
+    }
+
+    #[test]
+    fn apply_refuses_effect_without_known_layout() {
+        // G610 zone 0 lists effect 0x05, whose parameter layout is unknown.
+        let log = RefCell::new(Vec::new());
+        let call = |f: u8, p: &[u8]| -> Result<[u8; 16]> {
+            log.borrow_mut().push((f, p.to_vec()));
+            Ok([0; 16])
+        };
+        let mut state = read_state(g610).unwrap();
+        let action = Action::SetEffect { zone: 0, location: 1, effect: Effect::new(0x05) };
+        assert!(matches!(apply_with(call, &mut state, &action), Err(Error::Invalid(_))));
+        assert!(log.borrow().is_empty());
+        assert_eq!(state.sw_control, Some(false));
+    }
+
+    #[test]
+    fn apply_writes_clamped_values() {
+        let log = RefCell::new(Vec::new());
+        let call = |f: u8, p: &[u8]| -> Result<[u8; 16]> {
+            log.borrow_mut().push((f, p.to_vec()));
+            Ok([0; 16])
+        };
+        let mut state = read_state(g610).unwrap();
+        let wild = Effect { color: [255, 0, 0], period: 50000, intensity: 200, ..Effect::new(0x0a) };
+        apply_with(call, &mut state, &Action::SetEffect { zone: 0, location: 1, effect: wild }).unwrap();
+        // Breathe at index 2: period 20000 ms (0x4e20), intensity 100 %.
+        assert_eq!(*log.borrow(), vec![(8, vec![1]), (3, vec![0, 2, 0xff, 0, 0, 0x4e, 0x20, 0, 0x64, 0, 0, 0])]);
+        assert_eq!(state.zones[0].current.as_ref().map(|e| (e.period, e.intensity)), Some((20000, 100)));
     }
 
     #[test]
@@ -651,8 +720,8 @@ mod tests {
             Ok([0; 16])
         };
         let mut state = read_state(g502).unwrap();
-        apply_with(&call, &mut state, &Action::SetControl(true)).unwrap();
-        apply_with(&call, &mut state, &Action::SetControl(false)).unwrap();
+        apply_with(call, &mut state, &Action::SetControl(true)).unwrap();
+        apply_with(call, &mut state, &Action::SetControl(false)).unwrap();
         assert_eq!(*log.borrow(), vec![(8, vec![1]), (8, vec![0])]);
         assert_eq!(state.sw_control, Some(false));
     }

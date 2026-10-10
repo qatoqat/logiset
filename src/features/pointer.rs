@@ -50,6 +50,7 @@ impl DpiRange {
         (self.min..=self.max).contains(&dpi) && (dpi - self.min).is_multiple_of(self.step)
     }
 
+    /// The grid value closest to `dpi`; a tie goes to the lower value.
     fn nearest(&self, dpi: u16) -> u16 {
         if dpi <= self.min {
             return self.min;
@@ -57,15 +58,39 @@ impl DpiRange {
         if dpi >= self.max {
             return self.max;
         }
-        let (min, step) = (u32::from(self.min), u32::from(self.step));
-        let steps = (u32::from(dpi) - min + step / 2) / step;
-        (min + steps * step).min(u32::from(self.max)) as u16
+        let (offset, step) = (u32::from(dpi - self.min), u32::from(self.step));
+        let rem = offset % step;
+        let lower = offset - rem;
+        let snapped = if rem * 2 <= step { lower } else { lower + step };
+        (u32::from(self.min) + snapped).min(u32::from(self.max)) as u16
     }
 }
 
 impl DpiChoices {
     pub fn contains(&self, dpi: u16) -> bool {
         self.discrete.contains(&dpi) || self.ranges.iter().any(|r| r.contains(dpi))
+    }
+
+    /// The only thing the sensor offers, when it is one range with no discrete values.
+    pub fn single_range(&self) -> Option<DpiRange> {
+        match (self.discrete.as_slice(), self.ranges.as_slice()) {
+            ([], [range]) => Some(*range),
+            _ => None,
+        }
+    }
+
+    /// Move each discrete value that sits one step beyond a range into that range, so a
+    /// lone `100` before `150..=25600` step 50 becomes `100..=25600` step 50.
+    fn fold_into_ranges(mut self) -> Self {
+        for range in &mut self.ranges {
+            while let Some(i) = self.discrete.iter().position(|&v| v.checked_add(range.step) == Some(range.min)) {
+                range.min = self.discrete.remove(i);
+            }
+            while let Some(i) = self.discrete.iter().position(|&v| range.max.checked_add(range.step) == Some(v)) {
+                range.max = self.discrete.remove(i);
+            }
+        }
+        self
     }
 
     pub fn min(&self) -> Option<u16> {
@@ -249,6 +274,7 @@ fn read_dpi_list(dev: &Device, sensor: u8) -> Result<DpiChoices> {
 }
 
 /// Walk the DPI list pages. Returns the choices read and whether the terminator was seen.
+/// Discrete values beside a range are folded into it.
 fn parse_dpi_pages(pages: &[[u8; 16]]) -> Result<(DpiChoices, bool)> {
     let mut choices = DpiChoices::default();
     let mut last: Option<u16> = None;
@@ -270,7 +296,7 @@ fn parse_dpi_pages(pages: &[[u8; 16]]) -> Result<(DpiChoices, bool)> {
                 continue;
             }
             match v {
-                0 => return Ok((choices, true)),
+                0 => return Ok((choices.fold_into_ranges(), true)),
                 _ if v >> 13 == 0b111 => pending_step = Some(v & 0x1FFF),
                 _ => {
                     choices.discrete.push(v);
@@ -279,7 +305,7 @@ fn parse_dpi_pages(pages: &[[u8; 16]]) -> Result<(DpiChoices, bool)> {
             }
         }
     }
-    Ok((choices, false))
+    Ok((choices.fold_into_ranges(), false))
 }
 
 /// getSensorDpi reply: sensor echo, current DPI, default DPI (0 when not provided).
@@ -381,10 +407,40 @@ mod tests {
     fn parses_g502_dpi_list() {
         let (choices, ended) = parse_dpi_pages(&[G502_DPI_LIST]).unwrap();
         assert!(ended);
-        assert_eq!(choices.discrete, vec![100]);
-        assert_eq!(choices.ranges, vec![DpiRange { min: 150, max: 25600, step: 50 }]);
+        assert!(choices.discrete.is_empty(), "100 folds into the range");
+        assert_eq!(choices.ranges, vec![DpiRange { min: 100, max: 25600, step: 50 }]);
+        assert_eq!(choices.single_range(), Some(DpiRange { min: 100, max: 25600, step: 50 }));
         assert_eq!(choices.min(), Some(100));
         assert_eq!(choices.max(), Some(25600));
+    }
+
+    #[test]
+    fn folds_values_one_step_beyond_a_range() {
+        // 800, then 1000..=2000 step 200 (800 folds in below), then 2200 (folds in above).
+        let p = page(0, &[800, 0xE000 | 200, 2000, 2200]);
+        let (c, ended) = parse_dpi_pages(&[p]).unwrap();
+        assert!(ended);
+        assert!(c.discrete.is_empty());
+        assert_eq!(c.single_range(), Some(DpiRange { min: 800, max: 2200, step: 200 }));
+    }
+
+    #[test]
+    fn keeps_values_further_from_a_range() {
+        // 400 is two steps below the range that starts at 800, so it stays discrete.
+        let p = page(0, &[400, 800, 0xE000 | 200, 2000]);
+        let (c, ended) = parse_dpi_pages(&[p]).unwrap();
+        assert!(ended);
+        assert_eq!(c.discrete, vec![400]);
+        assert_eq!(c.ranges, vec![DpiRange { min: 800, max: 2000, step: 200 }]);
+        assert_eq!(c.single_range(), None);
+    }
+
+    #[test]
+    fn discrete_only_list_has_no_single_range() {
+        let p = page(0, &[400, 800, 1600]);
+        let (c, _) = parse_dpi_pages(&[p]).unwrap();
+        assert_eq!(c.discrete, vec![400, 800, 1600]);
+        assert_eq!(c.single_range(), None);
     }
 
     #[test]
@@ -405,7 +461,8 @@ mod tests {
         assert_eq!(c.nearest(125), Some(100), "tie goes to the lower value");
         assert_eq!(c.nearest(149), Some(150));
         assert_eq!(c.nearest(1620), Some(1600));
-        assert_eq!(c.nearest(1625), Some(1650));
+        assert_eq!(c.nearest(1625), Some(1600), "tie goes to the lower value");
+        assert_eq!(c.nearest(1626), Some(1650));
         assert_eq!(c.nearest(60000), Some(25600));
         assert_eq!(DpiChoices::default().nearest(800), None);
     }
@@ -415,7 +472,9 @@ mod tests {
         let p = page(0, &[100, 0xE000 | 30, 1010]);
         let (c, ended) = parse_dpi_pages(&[p]).unwrap();
         assert!(ended);
-        assert_eq!(c.ranges, vec![DpiRange { min: 130, max: 1000, step: 30 }]);
+        // 100 is one step below 130, so it folds in.
+        assert_eq!(c.ranges, vec![DpiRange { min: 100, max: 1000, step: 30 }]);
+        assert!(c.discrete.is_empty());
         assert!(!c.contains(1010));
     }
 

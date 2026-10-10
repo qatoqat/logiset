@@ -8,10 +8,11 @@ use crate::model::DeviceState;
 /// Auto-shift speed shown when the device has no factory value to start from.
 const DEFAULT_SPEED: u8 = 30;
 
-/// Editable copies of the SmartShift settings. Rebuilt whenever the device state changes.
+/// Editable copies of the SmartShift settings. Rebuilt whenever the device's SmartShift changes.
 #[derive(Default)]
 pub struct Draft {
-    synced: Option<State>,
+    /// The SmartShift last copied from the device. `None` until the first copy.
+    synced: Option<Option<SmartShift>>,
     ratchet: bool,
     auto_shift: bool,
     speed: u8,
@@ -19,10 +20,14 @@ pub struct Draft {
 }
 
 impl Draft {
-    /// Copy what the device reports into the editable fields.
-    fn sync(&mut self, state: &State) {
-        self.synced = Some(state.clone());
-        if let Some(ss) = &state.smartshift {
+    /// Copy the device's SmartShift into the editable fields when it differs from the last copy.
+    /// Other wheel state, such as the hi-res invert flag, keeps unapplied edits.
+    fn follow(&mut self, smartshift: Option<&SmartShift>) {
+        if self.synced.as_ref().map(Option::as_ref) == Some(smartshift) {
+            return;
+        }
+        self.synced = Some(smartshift.cloned());
+        if let Some(ss) = smartshift {
             self.ratchet = ss.ratchet;
             self.auto_shift = ss.threshold != NEVER_SHIFT;
             self.speed = if self.auto_shift {
@@ -36,9 +41,7 @@ impl Draft {
 }
 
 pub fn show(ui: &mut egui::Ui, _dev: &DeviceState, state: &State, draft: &mut Draft, out: &mut Vec<Action>) {
-    if draft.synced.as_ref() != Some(state) {
-        draft.sync(state);
-    }
+    draft.follow(state.smartshift.as_ref());
     if let Some(ss) = &state.smartshift {
         smartshift(ui, ss, draft, out);
     }
@@ -104,5 +107,51 @@ fn hires_section(ui: &mut egui::Ui, hires: &HiRes, out: &mut Vec<Action>) {
         }
     } else {
         ui.label(RichText::new("This device cannot invert the scroll direction.").weak());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shift(ratchet: bool, threshold: u8) -> SmartShift {
+        SmartShift { feature: 0x2111, ratchet, threshold, default_threshold: None, torque: Some(40) }
+    }
+
+    #[test]
+    fn unrelated_state_keeps_unapplied_edits() {
+        let mut draft = Draft::default();
+        let device = shift(true, 30);
+        draft.follow(Some(&device));
+        assert!(draft.ratchet);
+        assert_eq!(draft.speed, 30);
+
+        draft.ratchet = false;
+        draft.speed = 80;
+        // Only the hi-res invert flag changed; the SmartShift part is the same.
+        draft.follow(Some(&device));
+        assert_eq!((draft.ratchet, draft.speed), (false, 80));
+    }
+
+    #[test]
+    fn smartshift_change_resyncs_draft() {
+        let mut draft = Draft::default();
+        draft.follow(Some(&shift(true, 30)));
+        draft.speed = 80;
+
+        draft.follow(Some(&shift(false, NEVER_SHIFT)));
+        assert!(!draft.ratchet);
+        assert!(!draft.auto_shift);
+        assert_eq!(draft.speed, DEFAULT_SPEED);
+        assert_eq!(draft.torque, 40);
+    }
+
+    #[test]
+    fn appearing_smartshift_is_copied() {
+        let mut draft = Draft::default();
+        draft.follow(None);
+        draft.follow(Some(&shift(true, 50)));
+        assert!(draft.ratchet);
+        assert_eq!(draft.speed, 50);
     }
 }
