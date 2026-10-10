@@ -1,0 +1,20 @@
+[package]
+name = "logiset"
+version = "0.1.0"
+edition = "2024"
+description = "Configure Logitech HID++ mice and keyboards: DPI, polling rate, lighting, onboard profiles and buttons"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/qatoqat/logiset"
+readme = "README.md"
+keywords = ["logitech", "hidpp", "mouse", "keyboard", "egui"]
+categories = ["hardware-support", "gui"]
+
+[dependencies]
+eframe = "0.36"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
