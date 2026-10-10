@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-apply logiset settings when Logitech devices connect
+Documentation=https://github.com/qatoqat/logiset
+
+[Service]
+ExecStart=/usr/bin/logiset apply --watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

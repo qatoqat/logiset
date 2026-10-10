@@ -1,0 +1,17 @@
+# logiset: give the logged-in user access to the HID++ interfaces of Logitech
+# devices. Keyboard and mouse boot interfaces (protocol 01/02) are left alone.
+
+ACTION!="add|change", GOTO="logiset_end"
+SUBSYSTEM!="hidraw", GOTO="logiset_end"
+
+# Bluetooth devices
+KERNELS=="0005:046D:*", TAG+="uaccess", GOTO="logiset_end"
+
+# USB receivers and cabled devices
+ATTRS{idVendor}=="046d", GOTO="logiset_usb"
+GOTO="logiset_end"
+
+LABEL="logiset_usb"
+ATTRS{bInterfaceProtocol}=="00", TAG+="uaccess"
+
+LABEL="logiset_end"

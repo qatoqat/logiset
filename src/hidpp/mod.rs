@@ -120,7 +120,8 @@ impl Transport {
             reports: info.reports,
             writer: Mutex::new(node.writer),
             rx: Mutex::new(node.reports),
-            swid: AtomicU8::new(0),
+            // Start at a per-process offset so two logiset processes rarely share a software ID.
+            swid: AtomicU8::new(std::process::id() as u8),
             alive: AtomicBool::new(true),
             notifications: Mutex::new(Vec::new()),
         }))

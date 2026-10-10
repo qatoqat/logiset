@@ -1,0 +1,11 @@
+post_install() {
+    echo ">>> The udev rule gives your login session access to Logitech HID++ devices."
+    echo ">>> If a device still shows 'no permission', unplug and replug it."
+    echo ">>> Optional: keep settings applied after reconnects without the window open:"
+    echo ">>>   systemctl --user enable --now logiset.service"
+}
+
+post_upgrade() {
+    echo ">>> If you use the background service, restart it:"
+    echo ">>>   systemctl --user restart logiset.service"
+}

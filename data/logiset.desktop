@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=logiset
+GenericName=Logitech Device Settings
+Comment=Configure Logitech mice and keyboards: DPI, polling rate, lighting, onboard profiles and buttons
+Exec=logiset
+Icon=logiset
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=logitech;mouse;keyboard;dpi;polling;lighting;hidpp;g502;
+StartupWMClass=logiset
